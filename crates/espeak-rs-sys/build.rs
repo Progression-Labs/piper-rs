@@ -184,21 +184,16 @@ fn main() {
     );
 
     // Bindings
+    // The headers are read from the sources, by paths relative to the package, not from the copy
+    // of espeak-ng this script makes in OUT_DIR: bindgen tells cargo to watch every header it
+    // reads, and the copy is written after cargo took the build's timestamp (so the next build
+    // reran this script and recompiled everything above it) under a path that is one target
+    // directory's own (so a target directory copied to another checkout reran it too).
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
-        .clang_arg(format!("-I{}", espeak_dst.display()))
-        .clang_arg(format!(
-            "-I{}",
-            espeak_dst.join("src").join("include").display()
-        ))
-        // Not the headers bindgen read: they are the copy in OUT_DIR this script made a moment
-        // ago, newer than the timestamp cargo took when it started (so the next build reran
-        // it, and recompiled everything above), and under a path that is one target
-        // directory's own (so a target directory copied to another checkout reran it too).
-        // wrapper.h and ./espeak-ng, the sources of that copy, are watched below.
-        .parse_callbacks(Box::new(
-            bindgen::CargoCallbacks::new().rerun_on_header_files(false),
-        ))
+        .clang_arg("-I./espeak-ng")
+        .clang_arg("-I./espeak-ng/src/include")
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .generate()
         .expect("Failed to generate bindings");
 
