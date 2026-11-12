@@ -191,7 +191,14 @@ fn main() {
             "-I{}",
             espeak_dst.join("src").join("include").display()
         ))
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        // Not the headers bindgen read: they are the copy in OUT_DIR this script made a moment
+        // ago, newer than the timestamp cargo took when it started (so the next build reran
+        // it, and recompiled everything above), and under a path that is one target
+        // directory's own (so a target directory copied to another checkout reran it too).
+        // wrapper.h and ./espeak-ng, the sources of that copy, are watched below.
+        .parse_callbacks(Box::new(
+            bindgen::CargoCallbacks::new().rerun_on_header_files(false),
+        ))
         .generate()
         .expect("Failed to generate bindings");
 
