@@ -83,7 +83,7 @@ impl Piper {
         let phonemes = if is_phonemes {
             text.to_string()
         } else {
-            text_to_phonemes(text, &self.config.espeak.voice, None)
+            text_to_phonemes(text, &self.config.espeak.voice, None, true, false)
                 .map_err(|e| PiperError::PhonemizationError(format!("{}", e)))?
                 .join(" ")
         };
