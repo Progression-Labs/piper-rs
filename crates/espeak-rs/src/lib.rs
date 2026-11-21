@@ -1,5 +1,5 @@
 use espeak_rs_sys;
-use ffi_support::{rust_string_to_c, FfiStr};
+use ffi_support::FfiStr;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::env;
@@ -34,10 +34,18 @@ impl fmt::Display for ESpeakError {
 static LANG_SWITCH_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"\([^)]*\)").unwrap());
 static STRESS_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"[ˈˌ]").unwrap());
 static ESPEAKNG_INIT: Lazy<ESpeakResult<()>> = Lazy::new(|| {
-    let es_data_path_ptr = match locate_espeak_data() {
-        Some(dir) => rust_string_to_c(dir.display().to_string()),
-        None => std::ptr::null(),
+    let data_dir = match locate_espeak_data() {
+        Ok(dir) => dir,
+        Err(why) => return Err(ESpeakError(why)),
     };
+    // Lives for the call: espeak copies the path.
+    let Ok(data_dir) = ffi::CString::new(data_dir.display().to_string()) else {
+        return Err(ESpeakError(format!(
+            "the data directory {} has a NUL in its path",
+            data_dir.display()
+        )));
+    };
+    let es_data_path_ptr = data_dir.as_ptr();
     unsafe {
         let es_sample_rate = espeak_rs_sys::espeak_Initialize(
             espeak_rs_sys::espeak_AUDIO_OUTPUT_AUDIO_OUTPUT_RETRIEVAL,
@@ -56,39 +64,31 @@ static ESPEAKNG_INIT: Lazy<ESpeakResult<()>> = Lazy::new(|| {
     }
 });
 
-/// The directory holding `espeak-ng-data`, found at run time, never a path compiled in: the
-/// environment's (`PIPER_ESPEAKNG_DATA_DIRECTORY`), the working directory's, the executable's,
-/// else the data compiled into espeak-rs-sys, written once under the user's cache
-/// ([`embedded_data_dir`]). A build's own install directory is never looked in: it is one target
-/// directory's, and a binary run from another (a seeded worktree, a copied build) would look in a
-/// directory that is gone.
-fn locate_espeak_data() -> Option<PathBuf> {
-    // 1. Environment variable
+/// The directory holding `espeak-ng-data`, found at run time, never a path compiled in: the one
+/// `PIPER_ESPEAKNG_DATA_DIRECTORY` names, else the data compiled into espeak-rs-sys, written once
+/// under the user's cache ([`embedded_data_dir`]). No other copy is looked for (a working
+/// directory's or an executable's `espeak-ng-data`, the build's own install directory): one left
+/// from another build would change the phonemes with nothing said, and a build's directory is gone
+/// once its target is (a seeded worktree, a copied build).
+fn locate_espeak_data() -> Result<PathBuf, String> {
     if let Ok(dir) = env::var(PIPER_ESPEAKNG_DATA_DIRECTORY) {
         let p = PathBuf::from(dir);
-        if p.join(ESPEAKNG_DATA_DIR_NAME).exists() {
-            return Some(p);
+        if p.join(ESPEAKNG_DATA_DIR_NAME).is_dir() {
+            return Ok(p);
         }
+        return Err(format!(
+            "{PIPER_ESPEAKNG_DATA_DIRECTORY} is {}, which holds no `{ESPEAKNG_DATA_DIR_NAME}`",
+            p.display()
+        ));
     }
-    // 2. Current working directory
-    if let Ok(cwd) = env::current_dir() {
-        if cwd.join(ESPEAKNG_DATA_DIR_NAME).exists() {
-            return Some(cwd);
-        }
-    }
-    // 3. Directory of the current executable
-    if let Ok(exe) = env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            if dir.join(ESPEAKNG_DATA_DIR_NAME).exists() {
-                return Some(dir.to_path_buf());
-            }
-        }
-    }
-    // 4. The data compiled in, written out once.
-    embedded_data_dir(&cache_dir()?).ok()
+    let cache = cache_dir().ok_or(
+        "no cache directory (XDG_CACHE_HOME, LOCALAPPDATA or HOME) to write espeak-ng-data into",
+    )?;
+    embedded_data_dir(&cache)
+        .map_err(|e| format!("writing espeak-ng-data under {}: {e}", cache.display()))
 }
 
-/// `$XDG_CACHE_HOME`, else `~/.cache` (on Windows `%LOCALAPPDATA%`).
+/// `$XDG_CACHE_HOME`, else `%LOCALAPPDATA%`, else `~/.cache`.
 fn cache_dir() -> Option<PathBuf> {
     env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
@@ -98,15 +98,31 @@ fn cache_dir() -> Option<PathBuf> {
 
 /// The embedded `espeak-ng-data` written under `cache/espeak-rs/<content id>`, or found there
 /// from an earlier run: written to a directory of its own and renamed into place, so a run that
-/// dies midway leaves nothing another would take for whole. The directory returned is the one
-/// holding `espeak-ng-data`.
+/// dies midway leaves nothing another would take for whole. Writing it removes what earlier
+/// writes left there: another id's data (a build of other data, never read again) and partial
+/// directories whose writer is gone. The directory returned is the one holding `espeak-ng-data`.
 fn embedded_data_dir(cache: &std::path::Path) -> std::io::Result<PathBuf> {
     use espeak_rs_sys::data::{ESPEAK_NG_DATA, ESPEAK_NG_DATA_ID};
-    let dir = cache.join("espeak-rs").join(ESPEAK_NG_DATA_ID);
+    let root = cache.join("espeak-rs");
+    let dir = root.join(ESPEAK_NG_DATA_ID);
     if dir.join(ESPEAKNG_DATA_DIR_NAME).is_dir() {
         return Ok(dir);
     }
-    let partial = cache.join("espeak-rs").join(format!(
+    std::fs::create_dir_all(&root)?;
+    for entry in std::fs::read_dir(&root)?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let stale = match name.split_once(".partial-") {
+            // A partial whose writer still runs is that writer's.
+            Some((_, pid)) => !pid
+                .parse::<u32>()
+                .is_ok_and(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists()),
+            None => name != ESPEAK_NG_DATA_ID,
+        };
+        if stale {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+    let partial = root.join(format!(
         "{ESPEAK_NG_DATA_ID}.partial-{}",
         std::process::id()
     ));
@@ -160,7 +176,10 @@ pub fn _text_to_phonemes(
     if let Err(ref e) = Lazy::force(&ESPEAKNG_INIT) {
         return Err(e.clone());
     }
-    let set_voice_res = unsafe { espeak_rs_sys::espeak_SetVoiceByName(rust_string_to_c(language)) };
+    // C strings that live for the call (espeak reads them; nothing here frees what it made).
+    let language_c = ffi::CString::new(language)
+        .map_err(|_| ESpeakError(format!("the voice name `{language}` has a NUL in it")))?;
+    let set_voice_res = unsafe { espeak_rs_sys::espeak_SetVoiceByName(language_c.as_ptr()) };
     if set_voice_res != espeak_rs_sys::espeak_ERROR_EE_OK {
         return Err(ESpeakError(format!(
             "Failed to set eSpeak-ng voice to: `{}` ",
@@ -174,7 +193,10 @@ pub fn _text_to_phonemes(
     let phoneme_mode: i32 = calculated_phoneme_mode.try_into().unwrap();
     let mut sent_phonemes = Vec::new();
     let mut phonemes = String::new();
-    let mut text_c_char = rust_string_to_c(text) as *const ffi::c_char;
+    let text_c =
+        ffi::CString::new(text).map_err(|_| ESpeakError("the text has a NUL in it".to_string()))?;
+    // espeak moves this pointer through `text_c`'s buffer, which outlives the loop.
+    let mut text_c_char = text_c.as_ptr();
     let text_c_char_ptr = std::ptr::addr_of_mut!(text_c_char);
     let terminator: ffi::c_int = 0;
     while !text_c_char.is_null() {
@@ -314,7 +336,30 @@ mod tests {
     fn the_embedded_data_is_written_once_where_it_is_found() {
         let cache = env::temp_dir().join(format!("espeak-rs-cache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&cache);
+        // What earlier writes left: another build's data, a partial whose writer died, and one
+        // whose writer (pid 1, always there) still runs.
+        let root = cache.join("espeak-rs");
+        for left in [
+            "0123456789abcdef",
+            "0123456789abcdef.partial-999999999",
+            "x.partial-1",
+        ] {
+            std::fs::create_dir_all(root.join(left).join("espeak-ng-data")).unwrap();
+        }
         let dir = embedded_data_dir(&cache).unwrap();
+        assert!(
+            !root.join("0123456789abcdef").exists(),
+            "another id's data stays"
+        );
+        assert!(
+            !root.join("0123456789abcdef.partial-999999999").exists(),
+            "a dead partial stays"
+        );
+        assert!(
+            root.join("x.partial-1").exists(),
+            "a live writer's partial was taken"
+        );
+        std::fs::remove_dir_all(root.join("x.partial-1")).unwrap();
         assert!(dir.starts_with(cache.join("espeak-rs")));
         assert!(dir.join("espeak-ng-data/phontab").is_file());
         assert!(dir.join("espeak-ng-data/en_dict").is_file());
