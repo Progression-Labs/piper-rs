@@ -3,3 +3,8 @@
 #![allow(non_snake_case)]
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+
+/// espeak-ng-data, compiled in (build.rs `embed_data`).
+pub mod data {
+    include!(concat!(env!("OUT_DIR"), "/espeak_ng_data.rs"));
+}

@@ -142,6 +142,76 @@ fn macos_link_search_path() -> Option<String> {
     None
 }
 
+/// The libespeak-ng CMakeLists' compiled-in data path made relative (`espeak-ng-data`), in place.
+fn neutral_data_path(cmakelists: &Path) {
+    let text = std::fs::read_to_string(cmakelists).expect("reading libespeak-ng's CMakeLists.txt");
+    let from = "PATH_ESPEAK_DATA=\\\"${CMAKE_INSTALL_PREFIX}/share/espeak-ng-data\\\"";
+    let to = "PATH_ESPEAK_DATA=\\\"espeak-ng-data\\\"";
+    if text.contains(from) {
+        std::fs::write(cmakelists, text.replace(from, to))
+            .expect("writing libespeak-ng's CMakeLists.txt");
+    } else {
+        assert!(
+            text.contains(to),
+            "libespeak-ng's CMakeLists.txt no longer sets PATH_ESPEAK_DATA as this script expects"
+        );
+    }
+}
+
+/// `espeak_ng_data.rs`: every file of the built data directory, by its path in it, as bytes
+/// compiled into the crate (`ESPEAK_NG_DATA`), and an id of their content (`ESPEAK_NG_DATA_ID`),
+/// so espeak-rs puts the data where it can find it at run time. The generated code names the
+/// files by `OUT_DIR` at compile time only: no path of this build is in the crate.
+fn embed_data(data: &Path, rs: &Path) {
+    let mut files = Vec::new();
+    let mut pending = vec![data.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("reading espeak-ng-data") {
+            let path = entry.expect("an entry of espeak-ng-data").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    assert!(
+        !files.is_empty(),
+        "espeak-ng-data is empty: the build installed no data"
+    );
+    // FNV-1a over each file's name and bytes.
+    let mut id: u64 = 0xcbf29ce484222325;
+    let mut entries = String::new();
+    for file in &files {
+        let rel = file
+            .strip_prefix(data)
+            .expect("under espeak-ng-data")
+            .to_str()
+            .expect("an espeak-ng-data path is UTF-8")
+            .replace('\\', "/");
+        for b in rel
+            .bytes()
+            .chain(std::fs::read(file).expect("reading espeak-ng-data"))
+        {
+            id = (id ^ b as u64).wrapping_mul(0x100000001b3);
+        }
+        entries.push_str(&format!(
+            "    ({rel:?}, include_bytes!(concat!(env!(\"OUT_DIR\"), \"/share/espeak-ng-data/{rel}\"))),\n"
+        ));
+    }
+    std::fs::write(
+        rs,
+        format!(
+            "/// An id of the embedded data's content: where espeak-rs puts it is named for it.\n\
+             pub const ESPEAK_NG_DATA_ID: &str = \"{id:016x}\";\n\
+             /// espeak-ng-data as built: each file's path in it and its bytes.\n\
+             pub static ESPEAK_NG_DATA: &[(&str, &[u8])] = &[\n{entries}];\n"
+        ),
+    )
+    .expect("writing espeak_ng_data.rs");
+}
+
 fn main() {
     println!("cargo:rustc-link-lib=speechPlayer");
     println!("cargo:rustc-link-lib=espeak-ng");
@@ -174,6 +244,12 @@ fn main() {
         debug_log!("Copy {} to {}", espeak_src.display(), espeak_dst.display());
         copy_folder(&espeak_src, &espeak_dst);
     }
+    // espeak-ng compiles in where it is installed (CMAKE_INSTALL_PREFIX, this OUT_DIR) as the
+    // data directory it falls back to: a path that is one target directory's own, gone when that
+    // target is copied to another checkout (a seeded worktree) or the binary moved. The copy
+    // built here falls back to `espeak-ng-data` beside the working directory instead, and
+    // espeak-rs always passes a directory found at run time (the data, embedded below).
+    neutral_data_path(&espeak_dst.join("src/libespeak-ng/CMakeLists.txt"));
     // Speed up build
     env::set_var(
         "CMAKE_BUILD_PARALLEL_LEVEL",
@@ -240,6 +316,11 @@ fn main() {
         .always_configure(false);
 
     let bindings_dir = config.build();
+
+    embed_data(
+        &out_dir.join("share/espeak-ng-data"),
+        &out_dir.join("espeak_ng_data.rs"),
+    );
 
     // Search paths
     println!("cargo:rustc-link-search={}", out_dir.join("lib").display());

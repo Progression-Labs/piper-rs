@@ -50,6 +50,12 @@ fn init_espeak() -> ESpeakResult<()> {
     }
 }
 
+/// The directory holding `espeak-ng-data`, found at run time, never a path compiled in: the
+/// environment's (`PIPER_ESPEAKNG_DATA_DIRECTORY`), the working directory's, the executable's,
+/// else the data compiled into espeak-rs-sys, written once under the user's cache
+/// ([`embedded_data_dir`]). A build's own install directory is never looked in: it is one target
+/// directory's, and a binary run from another (a seeded worktree, a copied build) would look in a
+/// directory that is gone.
 fn locate_espeak_data() -> Option<PathBuf> {
     // 1. Environment variable
     if let Ok(dir) = env::var(PIPER_ESPEAKNG_DATA_DIRECTORY) {
@@ -72,7 +78,50 @@ fn locate_espeak_data() -> Option<PathBuf> {
             }
         }
     }
-    None
+    // 4. The data compiled in, written out once.
+    embedded_data_dir(&cache_dir()?).ok()
+}
+
+/// `$XDG_CACHE_HOME`, else `~/.cache` (on Windows `%LOCALAPPDATA%`).
+fn cache_dir() -> Option<PathBuf> {
+    env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("LOCALAPPDATA").map(PathBuf::from))
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+}
+
+/// The embedded `espeak-ng-data` written under `cache/espeak-rs/<content id>`, or found there
+/// from an earlier run: written to a directory of its own and renamed into place, so a run that
+/// dies midway leaves nothing another would take for whole. The directory returned is the one
+/// holding `espeak-ng-data`.
+fn embedded_data_dir(cache: &std::path::Path) -> std::io::Result<PathBuf> {
+    use espeak_rs_sys::data::{ESPEAK_NG_DATA, ESPEAK_NG_DATA_ID};
+    let dir = cache.join("espeak-rs").join(ESPEAK_NG_DATA_ID);
+    if dir.join(ESPEAKNG_DATA_DIR_NAME).is_dir() {
+        return Ok(dir);
+    }
+    let partial = cache.join("espeak-rs").join(format!(
+        "{ESPEAK_NG_DATA_ID}.partial-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&partial);
+    for (rel, bytes) in ESPEAK_NG_DATA {
+        let file = partial.join(ESPEAKNG_DATA_DIR_NAME).join(rel);
+        std::fs::create_dir_all(file.parent().expect("a file in a directory"))?;
+        std::fs::write(&file, bytes)?;
+    }
+    match std::fs::rename(&partial, &dir) {
+        Ok(()) => Ok(dir),
+        // Another process put it there first: theirs is the same content.
+        Err(_) if dir.join(ESPEAKNG_DATA_DIR_NAME).is_dir() => {
+            let _ = std::fs::remove_dir_all(&partial);
+            Ok(dir)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&partial);
+            Err(e)
+        }
+    }
 }
 
 /// Strip inline language-switch markers of the form `(xx)` that espeak inserts
@@ -222,6 +271,35 @@ mod tests {
         assert!(!phonemes.contains("(en)"));
         assert!(!phonemes.contains("(ar)"));
         Ok(())
+    }
+
+    /// The embedded data is written once under the cache, named for its content, and is a data
+    /// directory espeak-ng reads (its phoneme table there); a second call finds it.
+    #[test]
+    fn the_embedded_data_is_written_once_where_it_is_found() {
+        let cache = env::temp_dir().join(format!("espeak-rs-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache);
+        let dir = embedded_data_dir(&cache).unwrap();
+        assert!(dir.starts_with(cache.join("espeak-rs")));
+        assert!(dir.join("espeak-ng-data/phontab").is_file());
+        assert!(dir.join("espeak-ng-data/en_dict").is_file());
+        let written = std::fs::metadata(dir.join("espeak-ng-data/phontab"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(embedded_data_dir(&cache).unwrap(), dir);
+        let again = std::fs::metadata(dir.join("espeak-ng-data/phontab"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(written, again, "written once");
+        let leftovers: Vec<_> = std::fs::read_dir(cache.join("espeak-rs"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("partial"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        let _ = std::fs::remove_dir_all(&cache);
     }
 
     #[test]
